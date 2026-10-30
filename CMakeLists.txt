@@ -61,6 +61,7 @@ endif()
 #
 add_library(${PROJECT_NAME}
   SHARED
+  src/rga_converter.cpp
   src/encoder.cpp
   src/decoder.cpp
   src/utils.cpp
@@ -79,6 +80,12 @@ target_link_libraries(${PROJECT_NAME}
     cv_bridge::cv_bridge
     rclcpp::rclcpp
     sensor_msgs::sensor_msgs_library)
+
+pkg_check_modules(RGA QUIET IMPORTED_TARGET librga)
+if(RGA_FOUND)
+  target_link_libraries(${PROJECT_NAME} PRIVATE PkgConfig::RGA)
+  target_compile_definitions(${PROJECT_NAME} PRIVATE HAVE_RGA)
+endif()
 
 ament_export_targets(${PROJECT_NAME}Targets HAS_LIBRARY_TARGET)
 
