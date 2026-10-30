@@ -63,6 +63,7 @@ static void free_frame(AVFrame ** frame)
 
 void Encoder::closeCodec()
 {
+  rgaConverter_.reset();
   if (codecContext_) {
     avcodec_free_context(&codecContext_);
     // avcodec_close(codecContext_);
@@ -199,6 +200,7 @@ enum AVPixelFormat Encoder::findMatchingSourceFormat(
 void Encoder::doOpenCodec(int width, int height, const std::string & origEncoding)
 {
   int err = 0;
+  nv12Input_ = origEncoding == "nv12";
 
   codecContext_ = nullptr;
   if (encoder_.empty()) {
@@ -270,6 +272,22 @@ void Encoder::doOpenCodec(int width, int height, const std::string & origEncodin
   RCLCPP_INFO_STREAM(logger_, "av_source_pixel_format: " << utils::pix(codecContext_->sw_pix_fmt));
   RCLCPP_INFO_STREAM(logger_, "encoder (hw) format:    " << utils::pix(codecContext_->pix_fmt));
 
+  if (nv12Input_ && ((width % 2) || (height % 2) || codecContext_->sw_pix_fmt != AV_PIX_FMT_NV12)) {
+    throw std::runtime_error("nv12 input requires even dimensions and encoder pixel_format nv12");
+  }
+  if (useRga_ && !nv12Input_) {
+    const auto inputFormat = utils::ros_to_av_pix_format(cvBridgeTargetFormat_);
+    if (inputFormat != AV_PIX_FMT_BGR24 && inputFormat != AV_PIX_FMT_RGB24) {
+      throw std::runtime_error("RGA encoder conversion requires bgr8 or rgb8 input");
+    }
+    if (colorSpace_ == AVCOL_SPC_BT709 && colorRange_ == AVCOL_RANGE_JPEG) {
+      throw std::runtime_error("RGA does not support bt709 full-range conversion");
+    }
+  }
+  if (useRga_ || nv12Input_) {
+    codecContext_->color_range = colorRange_;
+    codecContext_->colorspace = colorSpace_;
+  }
   err = avcodec_open2(codecContext_, codec, NULL);
   utils::check_for_err("cannot open codec " + encoder_, err);
 
@@ -287,6 +305,8 @@ void Encoder::doOpenCodec(int width, int height, const std::string & origEncodin
   frame_->width = width;
   frame_->height = height;
   frame_->format = codecContext_->sw_pix_fmt;
+  frame_->color_range = codecContext_->color_range;
+  frame_->colorspace = codecContext_->colorspace;
   // allocate image for frame
   err = av_image_alloc(
     frame_->data, frame_->linesize, width, height, static_cast<AVPixelFormat>(frame_->format), 64);
@@ -309,11 +329,20 @@ void Encoder::doOpenCodec(int width, int height, const std::string & origEncodin
   wrapperFrame_ = av_frame_alloc();
   wrapperFrame_->width = width;
   wrapperFrame_->height = height;
-  wrapperFrame_->format = findMatchingSourceFormat(
+  wrapperFrame_->format = nv12Input_ ? AV_PIX_FMT_NV12 : findMatchingSourceFormat(
     cvBridgeTargetFormat_, static_cast<enum AVPixelFormat>(frame_->format));
 
   // initialize format conversion library
-  if (!swsContext_) {
+  if (nv12Input_) {
+    wrapperFrame_->color_range = colorRange_;
+    wrapperFrame_->colorspace = colorSpace_;
+    RCLCPP_INFO(logger_, "format conversion: NV12 passthrough");
+  } else if (useRga_) {
+    wrapperFrame_->color_range = AVCOL_RANGE_JPEG;
+    wrapperFrame_->colorspace = AVCOL_SPC_RGB;
+    rgaConverter_ = std::make_unique<RgaConverter>(rgaCores_);
+    RCLCPP_INFO(logger_, "format conversion: librga/im2d (hardware)");
+  } else if (!swsContext_) {
     swsContext_ = sws_getContext(
       width, height, static_cast<AVPixelFormat>(wrapperFrame_->format),  // src
       width, height, static_cast<AVPixelFormat>(frame_->format),         // dest
@@ -322,7 +351,7 @@ void Encoder::doOpenCodec(int width, int height, const std::string & origEncodin
       throw(std::runtime_error("cannot allocate sws context"));
     }
   }
-  encoding_ = codec_ + ";" + avSourcePixelFormat_ + ";" + cvBridgeTargetFormat_ + ";" +
+  encoding_ = codec_ + ";" + avSourcePixelFormat_ + ";" + (nv12Input_ ? "nv12" : cvBridgeTargetFormat_) + ";" +
               (origEncoding.empty() ? cvBridgeTargetFormat_ : origEncoding);
 }
 
@@ -345,7 +374,18 @@ void Encoder::encodeImage(const Image & msg)
     t0 = rclcpp::Clock().now();
   }
   try {
-    if (utils::encode_single_channel_as_color(
+    if (msg.encoding == "nv12") {
+      if (!nv12Input_ || msg.width != static_cast<uint32_t>(codecContext_->width) ||
+          msg.height != static_cast<uint32_t>(codecContext_->height) ||
+          msg.step < msg.width || msg.step > static_cast<uint32_t>(INT_MAX) ||
+          (msg.step % 2) || msg.data.size() < static_cast<size_t>(msg.step) * (msg.height + msg.height / 2)) {
+        throw std::runtime_error("invalid NV12 image dimensions, stride or data size");
+      }
+      cv::Mat img(msg.height, msg.width, CV_8UC1, const_cast<uint8_t *>(msg.data.data()), msg.step);
+      doEncodeImage(img, msg.header, t0);
+    } else if (nv12Input_) {
+      throw std::runtime_error("image encoding changed after NV12 encoder initialization");
+    } else if (utils::encode_single_channel_as_color(
           cvBridgeTargetFormat_, static_cast<AVPixelFormat>(wrapperFrame_->format))) {
       // hack to encode single-channel ros formats as nv12/yuv420p etc
       cv::Mat img(
@@ -369,6 +409,9 @@ void Encoder::encodeImage(const Image & msg)
 
 void Encoder::encodeImage(const cv::Mat & img, const Header & header, const rclcpp::Time & t0)
 {
+  if (nv12Input_) {
+    throw std::runtime_error("NV12 input requires a sensor_msgs Image with explicit stride");
+  }
   doEncodeImage(img, header, t0);
 }
 
@@ -382,30 +425,44 @@ void Encoder::doEncodeImage(const cv::Mat & img, const Header & header, const rc
     totalInBytes_ += img.cols * img.rows;  // raw size!
   }
   // bend the memory pointers in colorFrame to the right locations
-  av_image_fill_arrays(
-    wrapperFrame_->data, wrapperFrame_->linesize, &(img.data[0]),
-    static_cast<AVPixelFormat>(wrapperFrame_->format), wrapperFrame_->width, wrapperFrame_->height,
-    1 /* alignment, could be better*/);
-  sws_scale(
-    swsContext_, wrapperFrame_->data, wrapperFrame_->linesize, 0,  // src
-    codecContext_->height, frame_->data, frame_->linesize);        // dest
+  if (nv12Input_) {
+    const int filled = av_image_fill_arrays(
+      wrapperFrame_->data, wrapperFrame_->linesize, img.data, AV_PIX_FMT_NV12,
+      wrapperFrame_->width, wrapperFrame_->height, 1);
+    utils::check_for_err("cannot fill NV12 frame", filled);
+    wrapperFrame_->data[1] = img.data + img.step * img.rows;
+    wrapperFrame_->linesize[0] = wrapperFrame_->linesize[1] = static_cast<int>(img.step);
+  } else {
+    av_image_fill_arrays(
+      wrapperFrame_->data, wrapperFrame_->linesize, &(img.data[0]),
+      static_cast<AVPixelFormat>(wrapperFrame_->format), wrapperFrame_->width, wrapperFrame_->height, 1);
+  }
+  if (!nv12Input_ && useRga_) {
+    wrapperFrame_->pts = pts_;
+    rgaConverter_->convert(wrapperFrame_, frame_);
+  } else if (!nv12Input_) {
+    sws_scale(
+      swsContext_, wrapperFrame_->data, wrapperFrame_->linesize, 0,
+      codecContext_->height, frame_->data, frame_->linesize);
+  }
 
   if (measurePerformance_) {
     t2 = rclcpp::Clock().now();
     tdiffFrameCopy_.update((t2 - t1).seconds());
   }
 
-  frame_->pts = pts_++;  //
-  ptsToStamp_.insert(PTSMap::value_type(frame_->pts, {header.stamp, header.frame_id}));
+  AVFrame * input = nv12Input_ ? wrapperFrame_ : frame_;
+  input->pts = pts_++;
+  ptsToStamp_.insert(PTSMap::value_type(input->pts, {header.stamp, header.frame_id}));
 
   int ret;
   if (usesHardwareFrames_) {
-    ret = av_hwframe_transfer_data(hw_frame_, frame_, 0);  // from software -> hardware frame
+    ret = av_hwframe_transfer_data(hw_frame_, input, 0);  // from software -> hardware frame
     utils::check_for_err("error while copying frame to hw", ret);
-    hw_frame_->pts = frame_->pts;
+    hw_frame_->pts = input->pts;
   }
 
-  ret = avcodec_send_frame(codecContext_, usesHardwareFrames_ ? hw_frame_ : frame_);
+  ret = avcodec_send_frame(codecContext_, usesHardwareFrames_ ? hw_frame_ : input);
   if (measurePerformance_) {
     t3 = rclcpp::Clock().now();
     tdiffSendFrame_.update((t3 - t2).seconds());
