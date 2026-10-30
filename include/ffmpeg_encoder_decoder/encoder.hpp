@@ -17,6 +17,7 @@
 #define FFMPEG_ENCODER_DECODER__ENCODER_HPP_
 
 #include <ffmpeg_encoder_decoder/pts_map.hpp>
+#include <ffmpeg_encoder_decoder/rga_converter.hpp>
 #include <ffmpeg_encoder_decoder/tdiff.hpp>
 #include <ffmpeg_encoder_decoder/types.hpp>
 #include <functional>
@@ -85,6 +86,25 @@ namespace ffmpeg_encoder_decoder
 class Encoder
 {
 public:
+  // Set before initialization; requires librga/im2d and a working RGA device.
+  void setUseRga(bool enabled) { Lock lock(mutex_); useRga_ = enabled; }
+  void setEncoderColorSpace(const std::string & value) {
+    Lock lock(mutex_);
+    if (value == "bt601") { colorSpace_ = AVCOL_SPC_BT470BG; }
+    else if (value == "bt709") { colorSpace_ = AVCOL_SPC_BT709; }
+    else { throw std::invalid_argument("encoder_color_space must be bt601 or bt709"); }
+  }
+  void setEncoderColorRange(const std::string & value) {
+    Lock lock(mutex_);
+    if (value == "full") { colorRange_ = AVCOL_RANGE_JPEG; }
+    else if (value == "limited") { colorRange_ = AVCOL_RANGE_MPEG; }
+    else { throw std::invalid_argument("encoder_color_range must be full or limited"); }
+  }
+  void setRgaCores(int cores) {
+    Lock lock(mutex_);
+    if (cores < 0 || cores > 3) { throw std::invalid_argument("rga_cores must be 0..3"); }
+    rgaCores_ = cores;
+  }
   /**
   * \brief defines callback function signature.
   *
@@ -400,6 +420,12 @@ private:
   AVPacket * packet_{nullptr};
   // ------ libswscale state
   AVFrame * wrapperFrame_{nullptr};
+  bool nv12Input_{false};
+  AVColorSpace colorSpace_{AVCOL_SPC_BT470BG};
+  AVColorRange colorRange_{AVCOL_RANGE_JPEG};
+  bool useRga_{false};
+  int rgaCores_{3};
+  std::unique_ptr<RgaConverter> rgaConverter_;
   SwsContext * swsContext_{NULL};
   // ---------- other stuff
   int64_t pts_{0};
