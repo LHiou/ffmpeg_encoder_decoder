@@ -17,7 +17,6 @@
 #define FFMPEG_ENCODER_DECODER__ENCODER_HPP_
 
 #include <ffmpeg_encoder_decoder/pts_map.hpp>
-#include <ffmpeg_encoder_decoder/rga_converter.hpp>
 #include <ffmpeg_encoder_decoder/tdiff.hpp>
 #include <ffmpeg_encoder_decoder/types.hpp>
 #include <functional>
@@ -30,6 +29,8 @@
 #include <unordered_map>
 
 extern "C" {
+struct AVFilterContext;
+struct AVFilterGraph;
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavformat/avio.h>
@@ -56,10 +57,8 @@ namespace ffmpeg_encoder_decoder
   }
 
   ffmpeg_encoder_decoder::Encoder enc;
-  enc.setEncoder("libx265"); // set libav encoder
-  // note: will not be lossless unless we happen to have right pixel format
-  enc.setAVOption("x265-params", "lossless=1");
-  enc.setAVOption("crf", "0");
+  enc.setEncoder("libx264"); // set libav encoder
+  enc.addAVOption("crf", "0");
 
   sensor_msgs::msg::Image image;
   image.encoding = "bgr8";
@@ -86,25 +85,6 @@ namespace ffmpeg_encoder_decoder
 class Encoder
 {
 public:
-  // Set before initialization; requires librga/im2d and a working RGA device.
-  void setUseRga(bool enabled) { Lock lock(mutex_); useRga_ = enabled; }
-  void setEncoderColorSpace(const std::string & value) {
-    Lock lock(mutex_);
-    if (value == "bt601") { colorSpace_ = AVCOL_SPC_BT470BG; }
-    else if (value == "bt709") { colorSpace_ = AVCOL_SPC_BT709; }
-    else { throw std::invalid_argument("encoder_color_space must be bt601 or bt709"); }
-  }
-  void setEncoderColorRange(const std::string & value) {
-    Lock lock(mutex_);
-    if (value == "full") { colorRange_ = AVCOL_RANGE_JPEG; }
-    else if (value == "limited") { colorRange_ = AVCOL_RANGE_MPEG; }
-    else { throw std::invalid_argument("encoder_color_range must be full or limited"); }
-  }
-  void setRgaCores(int cores) {
-    Lock lock(mutex_);
-    if (cores < 0 || cores > 3) { throw std::invalid_argument("rga_cores must be 0..3"); }
-    rgaCores_ = cores;
-  }
   /**
   * \brief defines callback function signature.
   *
@@ -135,6 +115,15 @@ public:
    * \param encoder name of the libav encoder, e.g. libx264, hevc_nvenc etc
    */
   void setEncoder(const std::string & encoder_name);
+  // Set before initialize(). In auto mode the first image selects the input path.
+  void setInputFormat(const std::string & format);
+  void setHWDeviceName(const std::string & name);
+  void setHWPixelFormat(const std::string & format);
+  // An empty chain uses the software BGR8-to-NV12 filter.
+  void setConversionFilter(const std::string & chain);
+  // These describe the encoded NV12. The filter must perform the matching conversion.
+  void setEncoderColorSpace(const std::string & value);
+  void setEncoderColorRange(const std::string & value);
   /**
    * \brief adds AVOption setting to list of options to be applied before opening the encoder
    * \param key   name of AVOption to set, e.g. "preset"
@@ -170,8 +159,8 @@ public:
    * cv_bridge (cv_bridge_target_format). See explanation in the
    * README file. Must be set before calling initialize(), or else
    * it will default to "bgr8". The cv_bridge_target_format must
-   * be compatible with some AV_PIX_FMT* type, or else an exception
-   * will be thrown when calling initialize().
+   * be compatible with some AV_PIX_FMT* type; otherwise initialize()
+   * logs the error and returns false.
    *
    * \param fmt cv_bridge_target_format (see ROS image_encodings.hpp header)
    */
@@ -381,8 +370,18 @@ private:
   using Lock = std::unique_lock<std::recursive_mutex>;
 
   bool openCodec(int width, int height, const std::string & encoding);
-  void doOpenCodec(int width, int height, const std::string & encoding);
+  bool doOpenCodec(int width, int height, const std::string & encoding);
   void closeCodec();
+  bool openHwInput();
+  bool openConversionFilter();
+  void closeConversionFilter();
+  void encodeHwImage(
+    const uint8_t * data, size_t size, size_t step, const std::string & format,
+    const Header & header);
+  bool checkError(int error, const char * action) const;
+  bool uploadNv12Frame(AVFrame * frame);
+  bool convertBgrFrame(AVFrame * frame);
+  bool drainPackets();
   void doEncodeImage(const cv::Mat & img, const Header & header, const rclcpp::Time & t0);
   int drainPacket(int width, int height);
   AVPixelFormat pixelFormat(const std::string & f) const;
@@ -408,6 +407,16 @@ private:
 
   AVPixelFormat pixFormat_{AV_PIX_FMT_NONE};
   std::string cvBridgeTargetFormat_ = "bgr8";
+  std::string inputFormat_ = "auto";
+  std::string deviceName_;
+  std::string hardwareFormat_;
+  std::string conversionFilter_;
+  bool hwInput_{false};
+  std::string colorSpace_{"bt601"};
+  std::string colorRange_{"full"};
+  AVFilterGraph * conversionGraph_{nullptr};
+  AVFilterContext * filterSource_{nullptr};
+  AVFilterContext * filterSink_{nullptr};
   AVRational timeBase_{1, 100};
   AVRational frameRate_{100, 1};
   bool usesHardwareFrames_{false};
@@ -420,12 +429,6 @@ private:
   AVPacket * packet_{nullptr};
   // ------ libswscale state
   AVFrame * wrapperFrame_{nullptr};
-  bool nv12Input_{false};
-  AVColorSpace colorSpace_{AVCOL_SPC_BT470BG};
-  AVColorRange colorRange_{AVCOL_RANGE_JPEG};
-  bool useRga_{false};
-  int rgaCores_{3};
-  std::unique_ptr<RgaConverter> rgaConverter_;
   SwsContext * swsContext_{NULL};
   // ---------- other stuff
   int64_t pts_{0};

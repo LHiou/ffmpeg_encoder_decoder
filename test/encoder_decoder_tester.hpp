@@ -40,6 +40,8 @@ public:
   void setEncoder(const std::string & n) { enc_.setEncoder(n); }
   void setAVSourcePixelFormat(const std::string & f) { enc_.setAVSourcePixelFormat(f); }
   void setCVBridgeTargetFormat(const std::string & f) { enc_.setCVBridgeTargetFormat(f); }
+  void setEncoderColorRange(const std::string & range) { enc_.setEncoderColorRange(range); }
+  void setPixelTolerance(int tolerance) { pixel_tolerance_ = tolerance; }
   void addAVOption(const std::string & k, const std::string & v) { enc_.addAVOption(k, v); }
   void setExpectedPacketEncoding(const std::string & s) { expected_packet_encoding_ = s; }
   // ------- decoder side options
@@ -79,6 +81,7 @@ private:
   std::string decoder_name_;
   std::string final_ros_encoding_;
   std::string decoder_av_pix_fmt_;
+  int pixel_tolerance_{0};
   std::string expected_packet_encoding_;
   // --- statistics
   uint64_t image_sum_{0};
