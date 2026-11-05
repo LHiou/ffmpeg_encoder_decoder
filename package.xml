@@ -15,6 +15,7 @@
   <depend>cv_bridge</depend>
   <depend>ffmpeg</depend>
   <depend>libavdevice-dev</depend>
+  <depend>libavfilter-dev</depend>
   <depend>libopencv-imgproc-dev</depend>
   <depend>rclcpp</depend>
   <depend>sensor_msgs</depend>

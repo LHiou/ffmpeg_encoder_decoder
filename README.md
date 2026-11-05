@@ -49,6 +49,26 @@ Some of the encoders are hardware accelerated, some can handle more image format
 For the many AV options available for various libav encoders, and for ``qmax``, ``bit_rate`` and similar settings please refer to the ffmpeg documentation.
 
 ### The inner workings
+
+For BGR8 and NV12, `setInputFormat("auto")` (the default) selects the path
+from the first image's encoding. BGR8 uses `setConversionFilter()` or the
+default software filter when the chain is empty. NV12 bypasses conversion.
+Both paths send NV12 to the encoder, uploading it if the encoder takes
+hardware frames.
+
+For a Rockchip FFmpeg build with RGA filters, configure the encoder before
+`initialize()`:
+
+```cpp
+enc.setEncoder("h264_rkmpp");
+enc.setHWDeviceName("rkmpp");
+enc.setHWPixelFormat("drm_prime");
+enc.setConversionFilter("hwupload,scale_rkrga=format=nv12:async_depth=0");
+```
+
+These settings replace the direct librga options. Mono8, Bayer and other
+inputs use the original pipeline described below.
+
 ![overview_diagram](./doc/encoder_decoder.svg)
 
 The diagram above shows the stations that a ROS Image message passes as it traverses the encoder and decoder.

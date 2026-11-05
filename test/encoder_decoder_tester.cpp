@@ -17,6 +17,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdlib>
 #include <sensor_msgs/image_encodings.hpp>
 
 using namespace std::placeholders;
@@ -160,7 +161,9 @@ void EncoderDecoderTester::imageCallback(
         const uint8_t * p_orig = &(orig->data[row * orig->step + col * num_channels + channel]);
         const uint8_t * p = &(img->data[row * orig->step + col * num_channels + channel]);
         int err = static_cast<int>(*p) - static_cast<int>(*p_orig);
-        if (err && (err != last_err || col == 0 || col == img->width - 1)) {
+        if (
+          std::abs(err) > pixel_tolerance_ &&
+          (err != last_err || col == 0 || col == img->width - 1)) {
           std::cout << "mismatch image # " << rclcpp::Time(img->header.stamp).nanoseconds()
                     << " at line " << row << " col: " << col << " chan: " << channel
                     << ", orig: " << static_cast<int>(*p_orig) << " now: " << static_cast<int>(*p)
